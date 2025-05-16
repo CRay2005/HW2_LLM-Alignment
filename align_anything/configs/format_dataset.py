@@ -241,6 +241,49 @@ class PKUSafeRLHF(BaseFormatter):
             {'role': 'assistant', 'content': response},
         ], {}
 
+@register_template('HOMEWORK')
+class HOMEWORK(BaseFormatter):
+    system_prompt: str = ''
+    '''
+    def __init__(
+        self,
+        formatter: AutoTokenizer | AutoProcessor,
+        template: str | None = None,
+        custom_formatter: Callable | None = None,
+    ) -> None:
+        self.dataset_formatter = None
+        if template:
+            self.dataset_formatter = template_registry.get_template_class(template)
+        self.model_formatter = ModelFormatter(formatter, custom_formatter)
+    '''
+
+    def format_preference_sample(
+        self, raw_sample: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        
+        # metrics = raw_sample['overall_response_id']
+        metrics = raw_sample['overall_response']
+        better_response = raw_sample[f'response_{int(metrics)}']
+        worse_response = raw_sample[f'response_{3-int(metrics)}']
+        question = raw_sample['question']
+ 
+        better_conversation = [
+            {'role': 'user', 'content': question},
+            {'role': 'assistant', 'content': better_response},
+        ]
+
+        worse_conversation = [
+            {'role': 'user', 'content': question},
+            {'role': 'assistant', 'content': worse_response},
+        ]
+
+        meta_info = {
+            'better_response': better_response,
+            'worse_response': worse_response,
+            'question': question,
+        }
+
+        return better_conversation, worse_conversation, meta_info
 
 @register_template('Aligner')
 class Aligner(BaseFormatter):

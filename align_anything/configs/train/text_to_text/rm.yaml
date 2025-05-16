@@ -27,9 +27,9 @@ train_cfgs:
   # Seed for random number generator
   seed: 42
   # Batch size per device for training
-  per_device_train_batch_size: 1
+  per_device_train_batch_size: 5
   # Batch size per device for evaluation
-  per_device_eval_batch_size: 1
+  per_device_eval_batch_size: 10
   # The number of gradient accumulation steps
   gradient_accumulation_steps: 2
   # Whether to use gradient checkpointing
@@ -53,7 +53,8 @@ train_cfgs:
   # The evaluation interval in step-wise evaluation case
   eval_interval: 10
   # The reward modeling regularization
-  regularization: 0.001
+  # regularization: 0.001
+  regularization: 0.1
 # The data configurations
 data_cfgs:
   # Datasets to use for training

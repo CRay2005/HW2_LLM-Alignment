@@ -48,6 +48,10 @@ from align_anything.utils.tools import (
     update_dict,
 )
 
+from transformers import AutoTokenizer
+import json
+from pathlib import Path
+from torch.nn.utils.rnn import pad_sequence
 
 def strip_pad(seq: torch.Tensor, pad_token_id: int):
     # remove the pad token in the tensor
@@ -253,6 +257,10 @@ class DPOTrainer(SupervisedTrainerBase):
             self.logger.print('\n***** Evaluating at the beginning *****')
             self.logger.log(self.eval(), step=0)
 
+        if len(self.train_dataloader)==0:   #新增。当eval时，没有配置train_dataloader直接退出，避免报错
+            self.logger.print("train_dataloader is empty. Skipping training step.")
+            return
+        
         remain_epoch = self.cfgs.train_cfgs.epochs - (
             self.global_step // len(self.train_dataloader)
         )
@@ -306,11 +314,246 @@ class DPOTrainer(SupervisedTrainerBase):
                 )
                 self.logger.log(self.eval(), step=self.global_step)
             self.model.tput_timer.update_epoch_count()
+            
 
     @torch.no_grad()
     def eval(self) -> dict[str, Any]:
-        """Evaluate the model on the evaluation dataset."""
-        return {}
+        """Evaluate the model."""
+        # 在评估开始时重新固定随机种子
+        eval_seed = self.cfgs.train_cfgs.seed  # 使用同样的种子或指定新的固定种子
+        seed_everything(eval_seed)
+        self.logger.print(f'\n***** Evaluating with fixed seed {eval_seed} *****')
+        
+        self.logger.print('\n***** Evaluating *****')
+        if self.eval_dataloader is None:
+            return {}
+
+        # 加载初始模型
+        self.logger.print('Loading initial model...')
+        initial_model_path = "../Qwen2.5-0.5B-Instruct"
+        base_model, base_tokenizer, _ = load_pretrained_models(
+            initial_model_path,
+            model_max_length=self.cfgs.model_cfgs.model_max_length,
+            padding_side='left',
+            trust_remote_code=True,
+            bnb_cfgs=self.bnb_cfgs,
+            lora_cfgs=self.lora_cfgs,
+        )
+        base_model, *_ = deepspeed.initialize(
+            model=base_model,
+            config=self.ds_eval_cfgs,
+        )
+
+        # 加载奖励模型
+        self.logger.print('Loading reward model...')
+        reward_model_path = "../outputs/qwen_2_5_rm/slice_end"
+        reward_model, reward_tokenizer, _ = load_pretrained_models(
+            reward_model_path,
+            model_max_length=self.cfgs.model_cfgs.model_max_length,
+            padding_side='right',
+            trust_remote_code=True,
+            is_reward_model=True,
+        )
+        reward_model, *_ = deepspeed.initialize(
+            model=reward_model,
+            config=self.ds_eval_cfgs,
+        )
+
+        # 进入评估模式
+        self.model.eval()
+        base_model.eval()
+        reward_model.eval()
+
+        eval_dataloader = tqdm(
+            self.eval_dataloader,
+            desc='Evaluating',
+            disable=not is_main_process(),
+            position=1,
+            leave=False,
+        )
+
+        all_results = []
+        dpo_scores = []
+        base_scores = []
+        batch = None
+        last_batch_results = []
+
+        for batch_idx, batch in enumerate(eval_dataloader):
+            # =======关键修改：只取批次的前半部分，避免重复======
+            # 获取批次大小
+            batch_size = len(batch['meta_info']['response_lens']) // 2  # 将实际批次大小除以2
+            
+            # 只保留每对中的第一个样本（避免处理相同prompt的两个版本）
+            # 对batch中的每个张量进行切片，只保留前半部分
+            filtered_batch = {
+                'input_ids': batch['input_ids'][:batch_size],
+                'attention_mask': batch['attention_mask'][:batch_size] if 'attention_mask' in batch else None,
+            }
+            
+            # 对meta_info也进行过滤
+            filtered_meta_info = {k: v[:batch_size] if isinstance(v, list) or isinstance(v, torch.Tensor) 
+                                else v for k, v in batch['meta_info'].items()}
+            filtered_batch['meta_info'] = filtered_meta_info
+            
+            # 使用过滤后的batch继续处理
+            batch = filtered_batch
+            # =======修改结束======
+            
+            # 提取prompt
+            prompts = []
+            
+            # 由于没有prompt_lens，我们需要从input_ids和response_lens计算prompt
+            for i in range(len(batch['meta_info']['response_lens'])):
+                response_len = batch['meta_info']['response_lens'][i]
+                input_ids = batch['input_ids'][i]
+                
+                # 去掉padding token
+                input_ids = strip_pad(input_ids, self.tokenizer.pad_token_id)
+                
+                # 总长度减去response长度就是prompt长度
+                total_len = input_ids.shape[0]
+                # 减去response_len并且考虑特殊token (通常是两个，BOS和EOS)
+                # 再 -2 ，否则会多取两个token
+                prompt_len = total_len - response_len -2 
+                
+                # 只取prompt部分的input_ids
+                prompt_ids = input_ids[:prompt_len]
+                prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                prompts.append(prompt_text)
+
+            # 使用DPO模型生成回复
+            # 批量编码所有prompt
+            batch_encoded_input = self.tokenizer(prompts, padding=True, return_tensors="pt").to(self.model.device)
+            # 批量生成
+            batch_output_ids = self.model.module.generate(
+                **batch_encoded_input,
+                max_new_tokens=512,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                # seed=eval_seed,  # 添加固定种子参数
+            )
+            # 批量解码
+            dpo_outputs = []
+            for i, output_ids in enumerate(batch_output_ids):
+                output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                dpo_output = output_text[len(prompts[i]):].strip()
+                dpo_outputs.append(dpo_output)
+
+            # 使用基础模型生成回复 - 批量处理版本
+            # 批量编码所有prompt
+            batch_encoded_input = base_tokenizer(prompts, padding=True, return_tensors="pt").to(base_model.device)
+            # 批量生成
+            batch_output_ids = base_model.module.generate(
+                **batch_encoded_input,
+                max_new_tokens=512,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                # seed=eval_seed,  # 添加固定种子参数
+            )
+            # 批量解码
+            base_outputs = []
+            for i, output_ids in enumerate(batch_output_ids):
+                output_text = base_tokenizer.decode(output_ids, skip_special_tokens=True)
+                base_output = output_text[len(prompts[i]):].strip()
+                base_outputs.append(base_output)
+
+            # 使用奖励模型为两组输出打分
+            for i in range(len(prompts)):
+                # 为DPO模型输出评分
+                dpo_input = reward_tokenizer(
+                    prompts[i] + dpo_outputs[i], 
+                    return_tensors="pt"
+                ).to(reward_model.device)
+                dpo_score = reward_model.module(**dpo_input).end_scores.item()
+                
+                # 为基础模型输出评分
+                base_input = reward_tokenizer(
+                    prompts[i] + base_outputs[i], 
+                    return_tensors="pt"
+                ).to(reward_model.device)
+                base_score = reward_model.module(**base_input).end_scores.item()
+                
+                # 收集结果
+                result = {
+                    "prompt": prompts[i],
+                    "dpo_output": dpo_outputs[i],
+                    "base_output": base_outputs[i],
+                    "dpo_score": float(dpo_score),
+                    "base_score": float(base_score),
+                    "score_diff": float(dpo_score - base_score)
+                }
+                all_results.append(result)
+                
+                dpo_scores.append(dpo_score)
+                base_scores.append(base_score)
+                
+                # 保存最后一个batch的结果用于展示
+                if batch_idx == len(eval_dataloader) - 1:
+                    last_batch_results.append(result)
+
+        # 如果没有评估数据，直接返回
+        if batch is None:
+            self.logger.print('WARNING: `eval_dataloader` is empty.')
+            return {}
+
+        # 计算指标
+        dpo_scores = torch.tensor(dpo_scores, device=self.model.device)
+        base_scores = torch.tensor(base_scores, device=self.model.device)
+        score_diffs = dpo_scores - base_scores
+        win_rate = (dpo_scores > base_scores).float().mean()
+        
+        # 收集统计信息
+        info = {
+            'eval/dpo_score_mean': dpo_scores.mean().item(),
+            'eval/base_score_mean': base_scores.mean().item(),
+            'eval/score_diff_mean': score_diffs.mean().item(),
+            'eval/score_diff_std': score_diffs.std().item(),
+            'eval/win_rate': win_rate.item(),
+        }
+        
+        # 将所有设备的结果收集到主进程
+        if is_main_process():
+            # 保存评估结果
+            save_path = Path(self.cfgs.logger_cfgs.output_dir) / "dpo_eval_results.json"
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(all_results, f, ensure_ascii=False, indent=4)
+            self.logger.print(f"Saved DPO evaluation results to {save_path}")
+            
+            # 打印最后一个batch的对比结果
+            max_num_rows = min(5, len(last_batch_results))
+            title = ', '.join(
+                f'{key.rpartition("/")[-1]} = {value:.6f}' for key, value in info.items()
+            )
+            
+            rows = []
+            for i in range(max_num_rows):
+                result = last_batch_results[i]
+                rows.append((
+                    result['prompt'][:100] + "..." if len(result['prompt']) > 100 else result['prompt'],
+                    result['dpo_output'][:100] + "..." if len(result['dpo_output']) > 100 else result['dpo_output'],
+                    result['base_output'][:100] + "..." if len(result['base_output']) > 100 else result['base_output'],
+                    f"{result['dpo_score']:.6f}",
+                    f"{result['base_score']:.6f}",
+                    f"{result['score_diff']:.6f}"
+                ))
+                
+            self.logger.print_table(
+                title=f'DPO Evaluation: {title}',
+                columns=[
+                    'prompt',
+                    'DPO output',
+                    'Base output',
+                    'DPO score',
+                    'Base score',
+                    'Score diff',
+                ],
+                rows=tuple(rows),
+                max_num_rows=max_num_rows,
+            )
+
+        return info
 
     def save(
         self,
@@ -347,7 +590,7 @@ def main():
     # finetune the model
     trainer = DPOTrainer(cfgs=cfgs, ds_cfgs=ds_cfgs)
     trainer.train()
-    trainer.save()
+    #trainer.save()
 
 
 if __name__ == '__main__':

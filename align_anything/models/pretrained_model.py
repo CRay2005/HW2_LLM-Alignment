@@ -182,6 +182,7 @@ def load_pretrained_models(  # pylint: disable=too-many-arguments
     is_reward_model: bool = False,
     processor_kwargs: dict[str, Any] = {},
     modality: list[str] | list[None] = [],
+    #safe_serialization=False,  # 添加这一行
 ) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     """Load pre-trained model and tokenizer from a given path."""
     model_name_or_path = os.path.expanduser(model_name_or_path)
@@ -224,6 +225,7 @@ def load_pretrained_models(  # pylint: disable=too-many-arguments
                 torch_dtype=dtype,
                 trust_remote_code=trust_remote_code,
                 **auto_model_kwargs,
+                #safe_serialization=safe_serialization,  # 添加这一行
             )
             model = get_peft_model(model, lora_config)
             model.print_trainable_parameters()

@@ -1,4 +1,7 @@
 ##### Project Specification #####
+Qwen2.5-0.5B-Instruct/
+align_anything_t2t/
+*.tar.gz
 output/
 outputs/
 wandb/

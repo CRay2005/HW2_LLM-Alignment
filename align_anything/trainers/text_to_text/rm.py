@@ -45,6 +45,8 @@ from align_anything.utils.tools import (
     update_dict,
 )
 
+import json
+from pathlib import Path
 
 class RMTrainer(SupervisedTrainerBase):
 
@@ -82,6 +84,7 @@ class RMTrainer(SupervisedTrainerBase):
             trust_remote_code=self.cfgs.model_cfgs.trust_remote_code,
             is_reward_model=True,
             processor_kwargs=self.cfgs.train_cfgs.processor_kwargs,
+            #safe_serialization=False,  # 添加这一行
         )
 
     def init_datasets(self) -> None:
@@ -160,6 +163,7 @@ class RMTrainer(SupervisedTrainerBase):
             return {}
 
         self.model.eval()
+        # 禁用梯度检查点以节省内存
         if self.cfgs.train_cfgs.gradient_checkpointing:
             self.model.gradient_checkpointing_disable()
         num_correct_predictions = 0
@@ -172,27 +176,50 @@ class RMTrainer(SupervisedTrainerBase):
             position=1,
             leave=False,
         )
-
+        # 新增，用于保存所有 (chosen, rejected, score_chosen, score_rejected)
+        all_results = []  
+        
         rewards = []
         batch = None
         for batch in eval_dataloader:
             output = self.model(**self.infer_batch(batch))
+            # 获取模型输出的最终奖励分数 end_scores
             end_scores = output.end_scores
+            # end_scores是形状为 (2*B, 1) 的张量
+            # 前 B 个是high rewards，后 B 个是low rewards
             higher_end_rewards, lower_end_rewards = end_scores.squeeze(dim=-1).chunk(
                 chunks=2, dim=0
             )
             batch_size = higher_end_rewards.size(0)
             num_correct_predictions += (higher_end_rewards > lower_end_rewards).sum()
             num_total_predictions += batch_size
-
+            # 添加元素到列表末尾， extend为扁平化添加，把两个张量作为独立元素加入到 rewards 列表中
             rewards.extend([higher_end_rewards, lower_end_rewards])
+            
+            # 新增，解包 input_ids 获取原始文本
+            input_ids = batch['input_ids']
+            better_input_ids, worse_input_ids = input_ids.chunk(chunks=2, dim=0)
+
+            # 新增，解码为文本
+            chosen_texts = self.tokenizer.batch_decode(better_input_ids, skip_special_tokens=True)
+            rejected_texts = self.tokenizer.batch_decode(worse_input_ids, skip_special_tokens=True)
+
+            # 新增，构建列表
+            for i in range(len(chosen_texts)):
+                all_results.append({
+                    'chosen': chosen_texts[i],
+                    'rejected': rejected_texts[i],
+                    'score_chosen': float(higher_end_rewards[i].item()),
+                    'score_rejected': float(lower_end_rewards[i].item())
+                })
+            
 
         if batch is None:
             self.logger.print('WARNING: `eval_dataloader` is empty.')
             return {}
-
+        # 计算预测准确率
         accuracy = num_correct_predictions / num_total_predictions
-        accuracy = get_all_reduce_mean(accuracy)
+        accuracy = get_all_reduce_mean(accuracy)  # 跨设备聚合准确率
 
         # Gather rewards from all devices for further analysis
         rewards = torch.cat(rewards, dim=0)
@@ -203,6 +230,13 @@ class RMTrainer(SupervisedTrainerBase):
         dist.gather(rewards, gathered_rewards, dst=0)
         if is_main_process():
             rewards = torch.cat(gathered_rewards, dim=0)
+            
+            # 新增，保存评分结果到文件
+            save_path = Path(self.cfgs.logger_cfgs.output_dir) / "reward_model_eval_results.json"
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(all_results, f, ensure_ascii=False, indent=4)
+            self.logger.print(f"Saved reward evaluation results to {save_path}")
+
 
         self.model.train()
         if self.cfgs.train_cfgs.gradient_checkpointing:
@@ -274,6 +308,12 @@ class RMTrainer(SupervisedTrainerBase):
 
         if self.cfgs.data_cfgs.eval_datasets:
             self.logger.log(self.eval(), step=0)
+
+        # ​​计算剩余的训练轮数（remain_epoch）和当前轮次的起始批次索引（start_batch_idx）​
+        # 主要用于​​从检查点（checkpoint）恢复训练时​​，确保训练能正确继续
+        if len(self.train_dataloader)==0:   #新增。当eval时，没有配置train_dataloader直接退出，避免报错
+            self.logger.print("train_dataloader is empty. Skipping training step.")
+            return
 
         remain_epoch = self.cfgs.train_cfgs.epochs - (
             self.global_step // len(self.train_dataloader)
